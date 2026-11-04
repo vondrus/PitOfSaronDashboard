@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pit-of-saron-dashboard"
+version = "1.0.0"
+description = "Interaktivní Plotly/Dash dashboard pro analýzu Mythic+ runů dungeonu Pit of Saron (data z Raider.IO API)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Daniel Abraham", email = "daniel.abraham@unicornuniversity.net" },
+    { name = "Ondřej Janeček", email = "ondrej.janecek@unicornuniversity.net" },
+    { name = "Petr Vondrus", email = "vondrus.petr@gmail.com" },
+]
+maintainers = [
+    { name = "Daniel Abraham", email = "daniel.abraham@unicornuniversity.net" },
+    { name = "Ondřej Janeček", email = "ondrej.janecek@unicornuniversity.net" },
+    { name = "Petr Vondrus", email = "vondrus.petr@gmail.com" },
+]
+keywords = ["dash", "plotly", "dashboard", "data-visualization", "world-of-warcraft", "mythic-plus", "raider-io"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Web Environment",
+    "Framework :: Dash",
+    "Intended Audience :: Education",
+    "Natural Language :: Czech",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+dependencies = [
+    "dash>=4.0",
+    "plotly>=6.0",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "tzdata; sys_platform == 'win32'",
+]
+
+[project.scripts]
+pos-dashboard = "pos_dashboard:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+py-modules = ["pos_dashboard"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q -p no:dash"
+
+[tool.ruff]
+line-length = 130
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "B", "UP", "SIM"]
