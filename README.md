@@ -14,7 +14,7 @@ rozhraní je v češtině.
 
 ### Rozvržení a stránky
 
-Dashboard je rozdělen na **5 stránek**, z nichž každá se vejde na běžnou Full HD obrazovku
+Dashboard je rozdělen na **6 stránek**, z nichž každá se vejde na běžnou Full HD obrazovku
 (1920 × 1080) bez posouvání. Vlevo je trvale zobrazen panel s globálními filtry, nahoře řada
 ukazatelů (KPI) a pod ní stránkování:
 
@@ -24,15 +24,16 @@ ukazatelů (KPI) a pod ní stránkování:
 | 2. Specializace a třídy | Žebříček + Podíl kategorií |
 | 3. Časy a výkon | Rozložení časů dokončení + Item level vs. čas dokončení |
 | 4. Složení týmů | Nejúspěšnější složení týmů |
-| 5. Žebříček runů | tabulka nejlepších / nejhorších runů |
+| 5. Vazby a toky | Vazby mezi třídami (tětivový diagram) + Tok složení k výsledku (Sankeyův diagram) |
+| 6. Žebříček runů | tabulka nejlepších / nejhorších runů |
 
 Mezi stránkami se přepíná **záložkami**, tlačítky **‹ Předchozí** / **Další ›** (vpravo je
-čítač „Strana X z 5“) nebo šipkami **←** / **→** na klávesnici (pokud není aktivní formulářový
+čítač „Strana X z 6“) nebo šipkami **←** / **→** na klávesnici (pokud není aktivní formulářový
 prvek). Filtry i nastavení grafů se při přepínání stránek zachovávají. Grafy se přizpůsobí
 výšce okna; na nižších obrazovkách (např. 1366 × 768) se obsah stránky mírně posouvá
 (stránkování zůstává přilepené nahoře) a na úzkých obrazovkách se filtry přesunou nad obsah.
 
-### Grafy (7 grafů, 6 typů)
+### Grafy (9 grafů, 8 typů)
 
 | Graf | Typ | Co ukazuje | Vlastní ovládací prvky |
 | ---- | --- | ---------- | ---------------------- |
@@ -43,6 +44,8 @@ výšce okna; na nižších obrazovkách (např. 1366 × 768) se obsah stránky 
 | **Rozložení časů dokončení** | krabicový / houslový | medián, kvartily a odlehlé hodnoty času podle skupin včetně časového limitu | skupiny, typ grafu, zobrazení bodů |
 | **Item level vs. čas dokončení** | bodový | vztah vybavení týmu a času, lineární trend a korelace | barva podle, max. počet bodů (posuvník), trend |
 | **Nejúspěšnější složení týmů** | sloupcový (horizontální) | nejčastější a nejrychlejší kombinace tank + healer + 3 DPS | úroveň detailu, řazení, min. počet runů, počet složení |
+| **Vazby mezi třídami** | tětivový (chord) | jak často se třídy potkávají ve stejném runu – všechny dvojice tříd v týmu, dvojice DPS tříd nebo dvojice tank → healer | zobrazení, min. podíl runů (posuvník), zvýraznění třídy (i kliknutím na segment), herní barvy tříd |
+| **Tok složení k výsledku** | tokový (Sankey) | jak se runy větví podle třídy tanka a healera (příp. úrovně klíče) a do jaké kategorie výsledného času dopadly | vrstvy, detail (třídy / specializace), kategorie času (třetiny výběru / rezerva do limitu), herní barvy tříd |
 
 Doplňují je **ukazatele (KPI)** – počet runů ve výběru, medián času, nejrychlejší run,
 nejvyšší klíč, průměrný item level, nejhranější tank a healer – a **žebříček runů** (tabulka
@@ -78,6 +81,7 @@ Všechny chyby a neobvyklé situace jsou uživateli srozumitelně oznámeny čes
 | žádná vybraná frakce, více než 5 požadovaných tříd, nenalezený hráč | chybové hlášení; grafy, KPI i tabulka ukazují „žádná data“ |
 | velmi malý výběr | upozornění na nespolehlivost statistik |
 | číselné vstupy mimo povolený rozsah (min. počet runů, počet řádků…) | hodnota je omezena na rozsah a zobrazí se upozornění |
+| žádná vazba tětivového diagramu nad zvoleným prahem, zvýrazněná třída bez vazeb | graf vyzve ke snížení prahu / zvýraznění se nepoužije a zobrazí se informace |
 | nesmyslná kombinace voleb (např. kumulativní medián) | volba se ignoruje a graf vysvětlí proč |
 | příliš mnoho bodů k vykreslení, málo dat pro trend či buňku heatmapy | omezení a informační poznámka u grafu |
 | neočekávaná chyba při vykreslení grafu | ostatní části dashboardu fungují dál, u grafu se zobrazí chyba (podrobnosti v logu) |
@@ -195,9 +199,7 @@ PitOfSaronDashboard/
 ├── pyproject.toml            # metadata projektu a závislosti
 ├── uv.lock                   # zamčené verze závislostí pro uv
 ├── requirements.txt          # závislosti pro pip
-├── pos_spec.txt              # zadání projektu
-├── pos_static_example.html   # prvotní statický návrh (inspirace)
-├── LICENSE
+├── LICENSE.txt
 └── README.md
 ```
 

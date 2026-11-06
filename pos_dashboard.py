@@ -37,8 +37,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
-from dash import Dash, Input, Output, State, ctx, dcc, html
-from plotly.colors import sample_colorscale
+from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
+from plotly.colors import hex_to_rgb, sample_colorscale, unlabel_rgb
+from werkzeug.serving import is_running_from_reloader
 
 __version__ = "1.0.0"
 
@@ -200,6 +201,27 @@ SCATTER_COLORS = {
 
 COMPOSITION_LEVELS = {"spec": "Specializace", "class": "Třídy"}
 COMPOSITION_METRICS = metric_options(("count", "median_time", "best_time", "mean_key", "max_key"))
+
+CHORD_MODES = {"all": "Všechny dvojice tříd v týmu", "dps": "Dvojice DPS tříd", "tank_healer": "Tank → healer"}
+# Default minimum share (% of runs) of a link; pair counts differ a lot between the modes.
+CHORD_DEFAULT_SHARE = {"all": 5, "dps": 3, "tank_healer": 1}
+CHORD_MAX_SHARE = 30
+CHORD_NONE = "none"
+
+FLOW_STAGES = {
+    "tank_healer_time": "Tank → healer → výsledný čas",
+    "key_tank_time": "Úroveň klíče → tank → výsledný čas",
+    "tank_healer_key": "Tank → healer → úroveň klíče",
+}
+FLOW_STAGE_COLUMNS = {
+    "tank_healer_time": ("tank", "healer", "time"),
+    "key_tank_time": ("key", "tank", "time"),
+    "tank_healer_key": ("tank", "healer", "key"),
+}
+FLOW_STAGE_PREFIXES = {"tank": "Tank", "healer": "Healer", "key": "Klíč", "time": "Čas"}
+FLOW_DETAIL = {"class": "Třídy", "spec": "Specializace"}
+FLOW_TIMING = {"terciles": "Třetiny výběru", "reserve": "Rezerva do limitu"}
+RESERVE_LOW, RESERVE_HIGH = 2, 4  # minutes left on the timer
 
 RUN_SORTS = {
     "clear": ("Čas dokončení", "clear_time_ms"),
@@ -976,6 +998,61 @@ def category_order(frame: pd.DataFrame, column: str) -> list[str]:
     if column == "key_label":
         return [f"+{level}" for level in sorted(frame["mythic_level"].unique())]
     return frame[column].value_counts().index.tolist()
+
+
+def class_pairs(selection: Selection, mode: str) -> pd.DataFrame:
+    """Count runs per class pair (columns ``a``, ``b``, ``count``, ``median_time``), most frequent first.
+
+    ``all`` and ``dps`` count every unordered pair of distinct classes once per run, ``tank_healer``
+    counts the ordered (tank class, healer class) pair of each run.
+    """
+    if mode == "tank_healer":
+        runs = selection.runs
+        frame = pd.DataFrame({"a": runs["tank_class"], "b": runs["healer_class"], "clear_min": runs["clear_min"]})
+    else:
+        members = selection.members
+        if mode == "dps":
+            members = members[members["role"] == "dps"]
+        unique = members.drop_duplicates(["run", "class"])[["run", "class", "clear_min"]]
+        joined = unique.merge(unique[["run", "class"]], on="run", suffixes=("_a", "_b"))
+        frame = joined[joined["class_a"] < joined["class_b"]].rename(columns={"class_a": "a", "class_b": "b"})
+    grouped = frame.groupby(["a", "b"], observed=True)
+    pairs = pd.DataFrame({"count": grouped.size(), "median_time": grouped["clear_min"].median()}).reset_index()
+    return pairs.sort_values(["count", "a", "b"], ascending=[False, True, True], ignore_index=True)
+
+
+def class_presence(selection: Selection, mode: str) -> pd.Series:
+    """Number of runs in which each class takes part in the given chord mode."""
+    if mode == "tank_healer":
+        runs = selection.runs
+        roles = [runs[["run", f"{role}_class"]].set_axis(["run", "class"], axis=1) for role in ("tank", "healer")]
+        return pd.concat(roles).drop_duplicates().groupby("class").size()
+    members = selection.members
+    if mode == "dps":
+        members = members[members["role"] == "dps"]
+    return members.drop_duplicates(["run", "class"]).groupby("class").size()
+
+
+def time_categories(runs: pd.DataFrame, method: str) -> pd.Series:
+    """Ordered result category (fast → slow) of each run, by selection terciles or timer reserve."""
+    if method == "reserve":
+        remaining = runs["remaining_min"]
+        labels = [
+            f"Rezerva ≥ {RESERVE_HIGH}:00",
+            f"Rezerva {RESERVE_LOW}:00–{RESERVE_HIGH}:00",
+            f"Rezerva < {RESERVE_LOW}:00",
+            "Mimo časový limit",
+        ]
+        codes = np.select([remaining >= RESERVE_HIGH, remaining >= RESERVE_LOW, remaining >= 0], [0, 1, 2], default=3)
+    else:
+        low, high = runs["clear_min"].quantile([1 / 3, 2 / 3]).tolist()
+        labels = [
+            f"Rychlé (≤ {fmt_duration(low)})",
+            f"Střední ({fmt_duration(low)}–{fmt_duration(high)})",
+            f"Pomalé (> {fmt_duration(high)})",
+        ]
+        codes = np.select([runs["clear_min"] <= low, runs["clear_min"] <= high], [0, 1], default=2)
+    return pd.Series(pd.Categorical.from_codes(codes, categories=labels, ordered=True), index=runs.index)
 
 
 @dataclass(frozen=True)
@@ -1815,6 +1892,366 @@ def build_compositions_figure(
     return ChartResult(figure, notes)
 
 
+def with_alpha(color: str, alpha: float) -> str:
+    """Return a hex or ``rgb()`` colour as an ``rgba()`` string."""
+    if color.startswith("#"):
+        red, green, blue = hex_to_rgb(color)
+    else:
+        red, green, blue = (round(float(value)) for value in unlabel_rgb(color)[:3])
+    return f"rgba({red}, {green}, {blue}, {alpha})"
+
+
+def class_color(scheme: ColorScheme, class_name: str, class_colors: bool) -> str:
+    """In-game class colour or a stable colour from the scheme palette."""
+    if class_colors:
+        return CLASS_COLORS.get(class_name, scheme.muted)
+    known = sorted(CLASS_COLORS)
+    return scheme.color(known.index(class_name)) if class_name in known else scheme.muted
+
+
+# Chord geometry in data units: ribbons end just inside the ring of class segments.
+CHORD_RIBBON_RADIUS = 0.97
+CHORD_RING = (1.0, 1.08)
+CHORD_LABEL_RADIUS = 1.14
+CHORD_LABEL_SPACING = 0.12  # minimum vertical distance between labels on one side
+CHORD_GAP = 0.025  # radians between segments
+
+
+def _polar(angles: np.ndarray, radius: float) -> tuple[np.ndarray, np.ndarray]:
+    """Cartesian coordinates of angles measured clockwise from the top."""
+    return radius * np.sin(angles), radius * np.cos(angles)
+
+
+def _arc(start: float, end: float, radius: float) -> tuple[np.ndarray, np.ndarray]:
+    return _polar(np.linspace(start, end, max(4, int(abs(end - start) / 0.03))), radius)
+
+
+def _to_centre(start: float, end: float, radius: float) -> tuple[np.ndarray, np.ndarray]:
+    """Quadratic Bézier between two points on the circle with the control point in the centre."""
+    t = np.linspace(0, 1, 24)
+    xs, ys = _polar(np.array([start, end]), radius)
+    return (1 - t) ** 2 * xs[0] + t**2 * xs[1], (1 - t) ** 2 * ys[0] + t**2 * ys[1]
+
+
+def _chord_label_positions(middles: Sequence[float]) -> list[tuple[float, float]]:
+    """Label positions on the label circle, pushed down along it so that labels on one side do not overlap."""
+    xs, ys = _polar(np.asarray(middles, dtype=float), CHORD_LABEL_RADIUS)
+    positions = [(float(x), float(y)) for x, y in zip(xs, ys, strict=True)]
+    for right_side in (True, False):
+        side = sorted((i for i, (x, _) in enumerate(positions) if (x >= 0) == right_side), key=lambda i: -positions[i][1])
+        previous = math.inf
+        for i in side:
+            y = min(positions[i][1], previous - CHORD_LABEL_SPACING)
+            x = math.sqrt(max(CHORD_LABEL_RADIUS**2 - y**2, 0.0)) * (1 if right_side else -1)
+            positions[i] = (x, y)
+            previous = y
+    return positions
+
+
+def build_chord_figure(
+    selection: Selection,
+    scheme: ColorScheme,
+    *,
+    mode: str = "all",
+    min_share: float = CHORD_DEFAULT_SHARE["all"],
+    highlight: str = CHORD_NONE,
+    class_colors: bool = True,
+) -> ChartResult:
+    """Chord diagram of how often classes appear together in the same run."""
+    if selection.empty:
+        return ChartResult(message_figure(scheme, NO_DATA))
+    total_runs = len(selection.runs)
+    pairs = class_pairs(selection, mode)
+    pairs["share"] = pairs["count"] / total_runs * 100
+    links = pairs[pairs["share"] >= min_share].reset_index(drop=True)
+
+    methods = {
+        "all": "Každý run započítá každou dvojici různých tříd svého týmu jednou; vazby třídy se sebou samou se "
+        "nezobrazují.",
+        "dps": "Každý run započítá každou dvojici různých tříd mezi svými třemi DPS jednou; vazby třídy se sebou "
+        "samou se nezobrazují.",
+        "tank_healer": "Každý run přispívá jednou dvojicí tank → healer; tank a healer stejné třídy tvoří smyčku "
+        "u jednoho segmentu.",
+    }
+    notes = [
+        Alert(
+            "info",
+            "Šířka pásu odpovídá počtu runů, v nichž se obě třídy potkaly; velikost segmentu je součet jeho "
+            "zobrazených vazeb, nikoli počet runů. " + methods[mode] + " Četnost společného výskytu sama "
+            "o sobě neprokazuje synergii.",
+        )
+    ]
+    hidden = len(pairs) - len(links)
+    if hidden:
+        notes.append(Alert("info", f"Skryto {fmt_int(hidden)} slabších vazeb s podílem pod {fmt_int(min_share)} % runů."))
+    if links.empty:
+        message = f"Žádná vazba nedosahuje podílu {fmt_int(min_share)} % runů – snižte práh."
+        return ChartResult(message_figure(scheme, message), notes)
+
+    arrow = "→" if mode == "tank_healer" else "↔"
+    top = links.head(5)
+    strongest = (f"{row.a} {arrow} {row.b} ({fmt_pct(row.share)})" for row in top.itertuples(index=False))
+    notes.append(Alert("info", "Nejčastější vazby: " + "; ".join(strongest) + "."))
+
+    weights = pd.concat([links.groupby("a")["count"].sum(), links.groupby("b")["count"].sum()]).groupby(level=0).sum()
+    weights = weights.sort_values(ascending=False, kind="stable")
+    presence = class_presence(selection, mode)
+    active = highlight if highlight in weights.index else None
+    if highlight not in (CHORD_NONE, None) and active is None:
+        notes.append(Alert("info", f"Třída {highlight} nemá při zvoleném prahu žádnou vazbu, zvýraznění se nepoužije."))
+
+    usable = 2 * math.pi - CHORD_GAP * len(weights)
+    segments: dict[str, list[float]] = {}  # class -> [start, end, cursor]
+    angle = 0.0
+    for name, weight in weights.items():
+        span = usable * weight / weights.sum()
+        segments[name] = [angle, angle + span, angle]
+        angle += span + CHORD_GAP
+
+    figure = base_figure(
+        scheme,
+        showlegend=False,
+        hovermode="closest",
+        margin={"l": 8, "r": 8, "t": 8, "b": 8},
+        xaxis={"visible": False, "range": [-1.55, 1.55]},
+        yaxis={"visible": False, "range": [-1.3, 1.3], "scaleanchor": "x", "scaleratio": 1},
+    )
+
+    ribbons = []
+    for row in links.itertuples(index=False):
+        ends = []
+        for name in (row.a, row.b):
+            start, end, cursor = segments[name]
+            width = (end - start) * row.count / weights[name]
+            ends.append((cursor, cursor + width))
+            segments[name][2] = cursor + width
+        ribbons.append((row, ends))
+
+    # Thinner ribbons are drawn first so the strongest links stay on top.
+    for row, ((a0, a1), (b0, b1)) in reversed(ribbons):
+        xs, ys = [], []
+        for part in (
+            _arc(a0, a1, CHORD_RIBBON_RADIUS),
+            _to_centre(a1, b0, CHORD_RIBBON_RADIUS),
+            _arc(b0, b1, CHORD_RIBBON_RADIUS),
+            _to_centre(b1, a0, CHORD_RIBBON_RADIUS),
+        ):
+            xs.extend(part[0])
+            ys.extend(part[1])
+        related = active is None or active in (row.a, row.b)
+        color = class_color(scheme, row.a, class_colors)
+        title = f"Tank {row.a} → healer {row.b}" if mode == "tank_healer" else f"{row.a} ↔ {row.b}"
+        figure.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines",
+                fill="toself",
+                fillcolor=color,
+                line={"color": color, "width": 0.5},
+                opacity=(0.5 if active is None else 0.85) if related else 0.06,
+                hoveron="fills",
+                hoverinfo="text",
+                text=(
+                    f"<b>{html_lib.escape(title)}</b><br>{fmt_int(row.count)} {runs_word(int(row.count))} · "
+                    f"{fmt_pct(row.share)} výběru<br>Medián času: {fmt_duration(row.median_time)}"
+                ),
+            )
+        )
+
+    marker_x, marker_y, marker_data = [], [], []
+    for name, (start, end, _) in segments.items():
+        color = class_color(scheme, name, class_colors)
+        outer_x, outer_y = _arc(start, end, CHORD_RING[1])
+        inner_x, inner_y = _arc(end, start, CHORD_RING[0])
+        figure.add_trace(
+            go.Scatter(
+                x=np.concatenate([outer_x, inner_x, outer_x[:1]]),
+                y=np.concatenate([outer_y, inner_y, outer_y[:1]]),
+                mode="lines",
+                fill="toself",
+                fillcolor=color,
+                line={"color": scheme.border_strong, "width": 0.5},
+                opacity=1 if active in (None, name) else 0.35,
+                hoverinfo="skip",
+            )
+        )
+        # Invisible markers along the segment carry its hover text and click target.
+        points = np.linspace(start, end, max(2, int((end - start) / 0.04)))
+        px, py = _polar(points, sum(CHORD_RING) / 2)
+        marker_x.extend(px)
+        marker_y.extend(py)
+        marker_data.extend([[name, fmt_int(weights[name]), fmt_int(presence.get(name, 0))]] * len(points))
+
+    middles = [(start + end) / 2 for start, end, _ in segments.values()]
+    leader_x: list[float | None] = []
+    leader_y: list[float | None] = []
+    for name, middle, (label_x, label_y) in zip(segments, middles, _chord_label_positions(middles), strict=True):
+        ideal_x, ideal_y = _polar(np.array([middle]), CHORD_LABEL_RADIUS)
+        if math.hypot(label_x - ideal_x[0], label_y - ideal_y[0]) > 0.02:
+            ring_x, ring_y = _polar(np.array([middle]), CHORD_RING[1])
+            leader_x += [float(ring_x[0]), label_x, None]
+            leader_y += [float(ring_y[0]), label_y, None]
+        figure.add_annotation(
+            x=label_x,
+            y=label_y,
+            text=f"<b>{html_lib.escape(name)}</b>" if name == active else html_lib.escape(name),
+            showarrow=False,
+            xanchor="left" if label_x >= 0 else "right",
+            yanchor="middle",
+            font={"size": 12, "color": scheme.text if active in (None, name) else scheme.muted},
+        )
+    if leader_x:
+        figure.add_trace(
+            go.Scatter(x=leader_x, y=leader_y, mode="lines", line={"color": scheme.muted, "width": 0.8}, hoverinfo="skip")
+        )
+
+    role_text = {"all": "v týmu", "dps": "mezi DPS", "tank_healer": "jako tank nebo healer"}[mode]
+    figure.add_trace(
+        go.Scatter(
+            x=marker_x,
+            y=marker_y,
+            mode="markers",
+            marker={"size": 14, "opacity": 0},
+            customdata=marker_data,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>Runů s touto třídou " + role_text + ": %{customdata[2]}<br>"
+                "Součet zobrazených vazeb: %{customdata[1]}<br><i>Kliknutím zvýrazníte vazby třídy.</i><extra></extra>"
+            ),
+        )
+    )
+    return ChartResult(figure, notes)
+
+
+def build_flow_figure(
+    selection: Selection,
+    scheme: ColorScheme,
+    *,
+    stages: str = "tank_healer_time",
+    detail: str = "class",
+    timing: str = "terciles",
+    class_colors: bool = True,
+) -> ChartResult:
+    """Sankey diagram linking team roles, key levels and result categories of the same runs."""
+    runs = selection.runs
+    if runs.empty:
+        return ChartResult(message_figure(scheme, NO_DATA))
+    total_runs = len(runs)
+    notes = [
+        Alert(
+            "info",
+            "Šířka pásu odpovídá počtu runů. Graf nezachycuje pohyb hráčů, ale propojuje kategorie týchž runů.",
+        )
+    ]
+
+    layers: list[tuple[str, pd.Series, list[str], list[str]]] = []  # (stage, values per run, order, colours)
+    for stage in FLOW_STAGE_COLUMNS[stages]:
+        if stage in ("tank", "healer"):
+            values = runs[f"{stage}_class" if detail == "class" else f"{stage}_label"]
+            order = values.value_counts().index.tolist()
+            class_of = dict(zip(values, runs[f"{stage}_class"], strict=True))
+            colors = [class_color(scheme, class_of[value], class_colors) for value in order]
+        elif stage == "key":
+            values = runs["key_label"]
+            order = category_order(runs, "key_label")
+            colors = scheme.ordinal_colors(len(order))
+        else:
+            values = time_categories(runs, timing)
+            semantic = [scheme.info, scheme.warning, scheme.danger, scheme.muted]
+            order = [label for label in values.cat.categories if (values == label).any()]
+            colors = [semantic[values.cat.categories.get_loc(label)] for label in order]
+            values = values.astype(str)
+            if timing == "reserve":
+                notes.append(
+                    Alert(
+                        "info",
+                        f"Výsledný čas je rozdělen podle rezervy do časového limitu klíče "
+                        f"(≥ {RESERVE_HIGH} min, {RESERVE_LOW}–{RESERVE_HIGH} min, < {RESERVE_LOW} min).",
+                    )
+                )
+            else:
+                notes.append(Alert("info", "Výsledný čas je rozdělen na třetiny podle časů aktuálního výběru."))
+            if "key" not in FLOW_STAGE_COLUMNS[stages] and runs["mythic_level"].nunique() > 1:
+                notes.append(
+                    Alert(
+                        "info",
+                        "Časy závisí na úrovni klíče – pro férové srovnání zužte filtr úrovně klíče na jednu hodnotu.",
+                    )
+                )
+        layers.append((stage, values, order, colors))
+
+    labels, node_colors, node_data, node_x, node_y, index = [], [], [], [], [], {}
+    # Explicit node centres keep the natural order (frequency, key level, fast → slow) in every column;
+    # the scale leaves room for the gaps Plotly puts between nodes.
+    gap = 0.03
+    scale = 1 - gap * (max(len(order) for _, _, order, _ in layers) - 1)
+    for position, (stage, values, order, colors) in enumerate(layers):
+        counts = values.value_counts()
+        cursor = 0.0
+        for value, color in zip(order, colors, strict=True):
+            index[(position, value)] = len(labels)
+            labels.append(f"{FLOW_STAGE_PREFIXES[stage]}: {value}")
+            node_colors.append(color)
+            count = int(counts[value])
+            node_data.append([f"{fmt_int(count)} {runs_word(count)}", fmt_pct(count / total_runs * 100)])
+            height = count / total_runs * scale
+            node_x.append(min(max(position / (len(layers) - 1), 0.001), 0.999))
+            node_y.append(min(max(cursor + height / 2, 0.001), 0.999))
+            cursor += height + gap
+
+    sources, targets, values_, link_colors, link_data = [], [], [], [], []
+    for position in range(len(layers) - 1):
+        frame = pd.DataFrame(
+            {"source": layers[position][1], "target": layers[position + 1][1], "clear_min": runs["clear_min"]}
+        )
+        grouped = frame.groupby(["source", "target"], observed=True)
+        flows = pd.DataFrame({"count": grouped.size(), "median_time": grouped["clear_min"].median()}).reset_index()
+        for row in flows.itertuples(index=False):
+            source = index[(position, row.source)]
+            sources.append(source)
+            targets.append(index[(position + 1, row.target)])
+            values_.append(int(row.count))
+            link_colors.append(with_alpha(node_colors[source], 0.35))
+            link_data.append(
+                [
+                    f"{fmt_int(row.count)} {runs_word(int(row.count))}",
+                    fmt_pct(row.count / total_runs * 100),
+                    fmt_duration(row.median_time),
+                ]
+            )
+
+    figure = base_figure(scheme, margin={"l": 8, "r": 8, "t": 12, "b": 8})
+    figure.add_trace(
+        go.Sankey(
+            arrangement="snap",
+            textfont={"color": scheme.text, "size": 12},
+            node={
+                "label": labels,
+                "color": node_colors,
+                "x": node_x,
+                "y": node_y,
+                "pad": 12,
+                "thickness": 16,
+                "line": {"color": scheme.border_strong, "width": 0.5},
+                "customdata": node_data,
+                "hovertemplate": "<b>%{label}</b><br>%{customdata[0]} (%{customdata[1]} výběru)<extra></extra>",
+            },
+            link={
+                "source": sources,
+                "target": targets,
+                "value": values_,
+                "color": link_colors,
+                "customdata": link_data,
+                "hovertemplate": (
+                    "%{source.label} → %{target.label}<br><b>%{customdata[0]}</b> (%{customdata[1]} výběru)<br>"
+                    "Medián času: %{customdata[2]}<extra></extra>"
+                ),
+            },
+        )
+    )
+    return ChartResult(figure, notes)
+
+
 # =============================================================================
 # 5. Dash layout
 # =============================================================================
@@ -1827,6 +2264,7 @@ PAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Specializace a třídy", ("leaders", "share")),
     ("Časy a výkon", ("dist", "scatter")),
     ("Složení týmů", ("comps",)),
+    ("Vazby a toky", ("chord", "flow")),
     ("Žebříček runů", ("runs",)),
 )
 
@@ -1914,6 +2352,9 @@ body { font-family: __FONT__; }
 .page-tabs label:hover { color: var(--text); border-color: var(--accent); }
 .page-tabs label.selected, .page-tabs label:has(input:checked) { background: var(--accent); border-color: var(--accent);
   color: var(--surface); }
+.page-tabs label.selected:hover, .page-tabs label:has(input:checked):hover { color: var(--surface); }
+/* Dash 4 recolours a focused selected option with the accent colour, which would hide the active tab text. */
+.page-tabs label.selected, .page-tabs label.selected * { color: var(--surface) !important; }
 .page-tabs label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
 .page-tabs .dash-options-list-option-wrapper, .page-tabs input { position: absolute; width: 1px; height: 1px;
   opacity: 0; overflow: hidden; }
@@ -2062,7 +2503,9 @@ def toggle(component_id: str, label: str, enabled: bool) -> dcc.Checklist:
     )
 
 
-def slider(component_id: str, minimum: int, maximum: int, value: int, step: int, marks: Iterable[int]) -> dcc.Slider:
+def slider(
+    component_id: str, minimum: int, maximum: int, value: int, step: int, marks: Iterable[int], suffix: str = ""
+) -> dcc.Slider:
     """Integer slider with formatted marks."""
     return dcc.Slider(
         id=component_id,
@@ -2070,7 +2513,7 @@ def slider(component_id: str, minimum: int, maximum: int, value: int, step: int,
         max=maximum,
         step=step,
         value=value,
-        marks={mark: fmt_int(mark) for mark in marks},
+        marks={mark: fmt_int(mark) + suffix for mark in marks},
         allow_direct_input=False,
         tooltip={"placement": "bottom", "always_visible": False},
     )
@@ -2384,7 +2827,7 @@ def _filter_panel(data: RunData, default: RunFilter) -> html.Section:
     )
 
 
-def _cards() -> dict[str, html.Section]:
+def _cards(classes: Sequence[str]) -> dict[str, html.Section]:
     """All dashboard cards keyed by id; pages pick from them."""
     charts = [
         chart_card(
@@ -2470,6 +2913,41 @@ def _cards() -> dict[str, html.Section]:
                 control("Počet složení", slider("comps-top", 3, 20, 10, 1, (3, 10, 15, 20)), class_name="slider"),
             ],
         ),
+        chart_card(
+            "chord",
+            "Vazby mezi třídami",
+            "Tětivový diagram – jak často se třídy potkávají ve stejném runu.",
+            [
+                control("Zobrazení", dropdown("chord-mode", CHORD_MODES, "all")),
+                control(
+                    "Min. podíl runů",
+                    slider("chord-min", 0, CHORD_MAX_SHARE, CHORD_DEFAULT_SHARE["all"], 1, (0, 10, 20, 30), suffix=f"{NBSP}%"),
+                    class_name="slider",
+                ),
+                control(
+                    "Zvýraznit třídu",
+                    dcc.Dropdown(
+                        id="chord-highlight",
+                        options=options({CHORD_NONE: "Bez zvýraznění", **{name: name for name in classes}}),
+                        value=CHORD_NONE,
+                        clearable=False,
+                        labels=DROPDOWN_LABELS,
+                    ),
+                ),
+                control("Barvy", toggle("chord-colors", "Herní barvy tříd", True)),
+            ],
+        ),
+        chart_card(
+            "flow",
+            "Tok složení k výsledku",
+            "Sankeyův diagram – jak se runy větví podle rolí a jak dopadly.",
+            [
+                control("Vrstvy", dropdown("flow-stages", FLOW_STAGES, "tank_healer_time")),
+                control("Detail", radio("flow-detail", FLOW_DETAIL, "class")),
+                control("Kategorie času", dropdown("flow-timing", FLOW_TIMING, "terciles")),
+                control("Barvy", toggle("flow-colors", "Herní barvy tříd", True)),
+            ],
+        ),
     ]
     cards = {card.id.removesuffix("-card"): card for card in charts}
     cards["runs"] = _runs_card()
@@ -2540,8 +3018,8 @@ def _pager() -> html.Nav:
     )
 
 
-def _pages() -> list[html.Section]:
-    cards = _cards()
+def _pages(classes: Sequence[str]) -> list[html.Section]:
+    cards = _cards(classes)
     return [
         html.Section(
             [cards[card_id] for card_id in card_ids],
@@ -2582,7 +3060,7 @@ def build_layout(data: RunData, scheme_key: str) -> html.Div:
                         children=[
                             html.Div(id="kpis", className="kpis", **{"aria-live": "polite"}),
                             _pager(),
-                            *_pages(),
+                            *_pages(data.bounds.classes),
                         ],
                     ),
                 ],
@@ -2594,6 +3072,15 @@ def build_layout(data: RunData, scheme_key: str) -> html.Div:
 # =============================================================================
 # 6. Dash callbacks
 # =============================================================================
+
+
+def clicked_class(click_data: Any) -> str | None:
+    """Class name of a clicked chord segment (its markers carry the name in ``customdata[0]``)."""
+    try:
+        name = click_data["points"][0]["customdata"][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return name if isinstance(name, str) else None
 
 
 def register_callbacks(app: Dash, data: RunData) -> None:
@@ -2821,6 +3308,69 @@ def register_callbacks(app: Dash, data: RunData) -> None:
             top_n=top_n,
         )
 
+    highlight_options = {CHORD_NONE: "", **{name: name for name in bounds.classes}}
+
+    @app.callback(
+        Output("chord-graph", "figure"),
+        Output("chord-notes", "children"),
+        Input(FILTER_STORE, "data"),
+        Input("scheme", "value"),
+        Input("chord-mode", "value"),
+        Input("chord-min", "value"),
+        Input("chord-highlight", "value"),
+        Input("chord-colors", "value"),
+    )
+    def update_chord(filters, scheme_key, mode, min_share, highlight, colors):
+        mode = choice(mode, CHORD_MODES, "all")
+        min_share, alert = coerce_int(
+            min_share, minimum=0, maximum=CHORD_MAX_SHARE, default=CHORD_DEFAULT_SHARE[mode], label="Min. podíl runů"
+        )
+        return chart(
+            build_chord_figure, filters, scheme_key, [alert],
+            mode=mode,
+            min_share=min_share,
+            highlight=choice(highlight, highlight_options, CHORD_NONE),
+            class_colors=bool(colors),
+        )
+
+    @app.callback(Output("chord-min", "value"), Input("chord-mode", "value"), prevent_initial_call=True)
+    def reset_chord_threshold(mode):
+        return CHORD_DEFAULT_SHARE[choice(mode, CHORD_MODES, "all")]
+
+    @app.callback(
+        Output("chord-highlight", "value"),
+        Input("chord-graph", "clickData"),
+        State("chord-highlight", "value"),
+        prevent_initial_call=True,
+    )
+    def highlight_clicked_class(click_data, current):
+        name = clicked_class(click_data)
+        if name not in highlight_options:
+            return no_update
+        return CHORD_NONE if name == current else name
+
+    @app.callback(
+        Output("flow-graph", "figure"),
+        Output("flow-notes", "children"),
+        Output("flow-timing", "disabled"),
+        Input(FILTER_STORE, "data"),
+        Input("scheme", "value"),
+        Input("flow-stages", "value"),
+        Input("flow-detail", "value"),
+        Input("flow-timing", "value"),
+        Input("flow-colors", "value"),
+    )
+    def update_flow(filters, scheme_key, stages, detail, timing, colors):
+        stages = choice(stages, FLOW_STAGES, "tank_healer_time")
+        figure, notes = chart(
+            build_flow_figure, filters, scheme_key,
+            stages=stages,
+            detail=choice(detail, FLOW_DETAIL, "class"),
+            timing=choice(timing, FLOW_TIMING, "terciles"),
+            class_colors=bool(colors),
+        )
+        return figure, notes, "time" not in FLOW_STAGE_COLUMNS[stages]
+
     @app.callback(
         Output("runs-table", "children"),
         Output("runs-notes", "children"),
@@ -2938,7 +3488,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Chyba: {exc}", file=sys.stderr)
         print("Cestu k datovému souboru lze zadat parametrem --data (viz --help).", file=sys.stderr)
         return 1
-    port_error = check_port(args.host, args.port)
+    # In --debug mode the reloader child inherits the socket already bound by its parent.
+    port_error = None if is_running_from_reloader() else check_port(args.host, args.port)
     if port_error:
         print(f"Chyba: server nelze spustit – {port_error}.", file=sys.stderr)
         print("Zkontrolujte parametry --host a --port.", file=sys.stderr)

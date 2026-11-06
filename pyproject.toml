@@ -9,7 +9,7 @@ description = "Interaktivní Plotly/Dash dashboard pro analýzu Mythic+ runů du
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE.txt"]
 authors = [
     { name = "Daniel Abraham", email = "daniel.abraham@unicornuniversity.net" },
     { name = "Ondřej Janeček", email = "ondrej.janecek@unicornuniversity.net" },

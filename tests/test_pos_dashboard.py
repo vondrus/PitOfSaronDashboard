@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 import socket
 from pathlib import Path
 
@@ -237,6 +238,9 @@ BUILDER_OPTIONS = [
                                      "points": app.DISTRIBUTION_POINTS}),
     (app.build_scatter_figure, {"color_by": app.SCATTER_COLORS}),
     (app.build_compositions_figure, {"level": app.COMPOSITION_LEVELS, "metric": app.COMPOSITION_METRICS}),
+    (app.build_chord_figure, {"mode": app.CHORD_MODES, "highlight": (app.CHORD_NONE, "Monk"),
+                              "class_colors": (True, False)}),
+    (app.build_flow_figure, {"stages": app.FLOW_STAGES, "detail": app.FLOW_DETAIL, "timing": app.FLOW_TIMING}),
 ]
 
 
@@ -277,6 +281,68 @@ def test_scatter_sampling(full: app.Selection):
     assert points == 500
 
 
+# --- chord and flow charts ------------------------------------------------------
+
+
+def test_class_pairs_count_each_run_once(full: app.Selection):
+    pairs = app.class_pairs(full, "all")
+    assert (pairs["a"] < pairs["b"]).all()
+    assert pairs["count"].max() <= len(full.runs)
+    assert pairs["count"].is_monotonic_decreasing
+    tank_healer = app.class_pairs(full, "tank_healer")
+    assert tank_healer["count"].sum() == len(full.runs)
+    expected = int(((full.runs["tank_class"] == "Monk") & (full.runs["healer_class"] == "Druid")).sum())
+    row = tank_healer[(tank_healer["a"] == "Monk") & (tank_healer["b"] == "Druid")]
+    assert int(row["count"].iloc[0]) == expected
+
+
+def test_class_presence(full: app.Selection):
+    presence = app.class_presence(full, "all")
+    with_monk = full.runs[[f"{slot}_class" for slot in app.SLOT_ROLES]].eq("Monk").any(axis=1).sum()
+    assert presence["Monk"] == with_monk
+
+
+@pytest.mark.parametrize("method", list(app.FLOW_TIMING))
+def test_time_categories_are_ordered(full: app.Selection, method):
+    categories = app.time_categories(full.runs, method)
+    assert categories.cat.ordered and len(categories) == len(full.runs)
+    medians = full.runs.groupby(categories, observed=True)["clear_min"].median()
+    assert medians.is_monotonic_increasing
+
+
+def test_chord_threshold_and_highlight(full: app.Selection):
+    strict = app.build_chord_figure(full, SCHEME, min_share=app.CHORD_MAX_SHARE + 50)
+    assert not strict.figure.data
+    unknown = app.build_chord_figure(full, SCHEME, highlight="Bard")
+    assert any("Bard" in note.message for note in unknown.notes)
+    loose = app.build_chord_figure(full, SCHEME, min_share=0)
+    ribbons = [trace for trace in loose.figure.data if trace.hoveron == "fills"]
+    assert len(ribbons) == len(app.class_pairs(full, "all"))
+
+
+def test_chord_labels_do_not_overlap():
+    positions = app._chord_label_positions([0.0, 0.02, 0.04, 6.25, 6.27, math.pi])
+    for right_side in (True, False):
+        ys = sorted(y for x, y in positions if (x >= 0) == right_side)
+        assert all(b - a >= app.CHORD_LABEL_SPACING - 1e-9 for a, b in zip(ys, ys[1:], strict=False))
+
+
+def test_flow_links_conserve_runs(full: app.Selection):
+    sankey = app.build_flow_figure(full, SCHEME, stages="tank_healer_time").figure.data[0]
+    healers = [i for i, label in enumerate(sankey.node.label) if label.startswith("Healer")]
+    incoming = sum(v for t, v in zip(sankey.link.target, sankey.link.value, strict=True) if t in healers)
+    outgoing = sum(v for s, v in zip(sankey.link.source, sankey.link.value, strict=True) if s in healers)
+    assert incoming == outgoing == len(full.runs)
+
+
+@pytest.mark.parametrize(
+    ("click", "expected"),
+    [({"points": [{"customdata": ["Monk", "1", "2"]}]}, "Monk"), ({"points": [{"curveNumber": 3}]}, None), (None, None)],
+)
+def test_clicked_class(click, expected):
+    assert app.clicked_class(click) == expected
+
+
 # --- application and CLI --------------------------------------------------------
 
 
@@ -292,7 +358,8 @@ def test_create_app(data: app.RunData):
 
 def test_every_card_is_on_exactly_one_page():
     card_ids = [card_id for _, ids in app.PAGES for card_id in ids]
-    assert sorted(card_ids) == sorted(["timeline", "heatmap", "leaders", "share", "dist", "scatter", "comps", "runs"])
+    expected = ["timeline", "heatmap", "leaders", "share", "dist", "scatter", "comps", "chord", "flow", "runs"]
+    assert sorted(card_ids) == sorted(expected)
 
 
 @pytest.mark.parametrize(
